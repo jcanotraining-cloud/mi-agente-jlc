@@ -1,0 +1,5 @@
+fecha,descripcion,tipo,monto,tipo_cambio
+2026-11-01,Deposito de cliente,INGRESO,5000,12.01
+2026-11-02,Pago de alquiler,EGRESO,1500,11.95
+2026-11-03,Transferencia recibida,INGRESO,2500,11.98
+2026-11-04,Pago de servicios,EGRESO,450,12.00

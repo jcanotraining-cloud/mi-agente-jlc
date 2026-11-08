@@ -19,6 +19,8 @@ from pypdf import PdfReader
 
 from config import DATOS, settings
 
+from pydantic import BaseModel, Field #Estructurar movimientos bancarios
+
 # ═══ S1 · Tools de lectura con APIs públicas ══════════════════════════════════════════
 apis = Capability(
     id="apis_publicas",
@@ -60,6 +62,24 @@ def clima_cochabamba() -> dict:
     respuesta = httpx.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
     respuesta.raise_for_status()
     return {"temperatura": respuesta.json()["current"]["temperature_2m"], "fuente": "Open Meteo"}
+
+@apis.tool_plain
+def tipo_cambio_bolivia() -> dict:
+    """Consulta el tipo de cambio del dólar estadounidense en Bolivia."""
+    url = "https://open.er-api.com/v6/latest/USD"
+
+    respuesta = httpx.get(url, timeout=10)
+    respuesta.raise_for_status()
+
+    datos = respuesta.json()
+
+    return {
+        "moneda_base": "USD",
+        "moneda_destino": "BOB",
+        "tipo_cambio": datos["rates"]["BOB"],
+        "fuente": "ExchangeRate-API",
+        "fecha_actualizacion": datos["time_last_update_utc"]
+    }
 
 
 # ═══ S1 · Mi contador: gastos en SQLite, una tool que lee y otra que escribe ══════════
@@ -192,3 +212,73 @@ def buscar_documentos(pregunta: str) -> list[dict]:
     for r in resultados:  # en la terminal (o en los Logs de Render) se ve qué recuperó
         print(f"  📄 {r['fuente']} (similitud {r['similitud']})", flush=True)
     return resultados
+
+
+# ═══ S3 · Mi agente Analizador de Movimientos Bancarios: movimientos registrados en SQLite ══════════
+Tipo = Literal["INGRESO", "EGRESO"]
+CSV_BANCO = DATOS / "movimientos_bancarios.csv"  # movimientos en archivo CSV
+DB_BANCO = DATOS / "movimientos_bancarios.db"  # movimientos en Base de Datos 
+
+
+def crear_base_bancaria() -> None:
+    """Crea movimientos_bancarios.db desde cero con los movimientos_bancarios.db del CSV."""
+    DB_BANCO.unlink(missing_ok=True)
+    with CSV_BANCO.open(encoding="utf-8") as movimiento_bancario:
+        filas = [(g["fecha"], g["descripcion"], g["tipo"], float(g["monto"]), float(g["tipo_cambio"])) for g in csv.DictReader(movimiento_bancario)]
+    conexion = sqlite3.connect(DB_BANCO)
+    with conexion:
+        conexion.execute(
+            "CREATE TABLE movimientos_bancarios (fecha TEXT, descripcion TEXT, tipo TEXT, monto REAL CHECK (monto > 0), tipo_cambio REAL CHECK (tipo_cambio > 0))"
+        )
+        conexion.executemany("INSERT INTO movimientos_bancarios VALUES (?, ?, ?, ?, ?)", filas)
+    conexion.close()
+
+def hoy() -> str:
+    """Instrucción dinámica: el modelo no sabe qué día es; se lo decimos en cada mensaje."""
+    return f"Hoy es {date.today().isoformat()}."
+
+# Lectura y escritura 
+consulta = Capability(
+    id="consulta_movimientos_bancarios",
+    description="Consulta movimientos_bancarios almacenados en una base de datos SQLite",
+    instructions="Usa la base de datos para responder preguntas sobre los movimientos_bancarios. No inventes datos.",
+)
+registro = Capability(
+    id="registro_movimientos_bancarios",
+    description="Registra nuevos movimientos_bancarios en la base de datos SQLite",
+    instructions=["Agrega nuevos movimientos_bancarios a la base de datos. Asegúrate de que los datos sean válidos. Y este registrado el tipo de cambio del dolar de la fecha de registro", hoy],
+)
+
+
+@consulta.tool_plain
+def consultar_movimientos_bancarios(tipo: Tipo) -> dict:
+    """Movimientos Bancarios de un tipo y su total en bolivianos."""
+    if not DB_BANCO.exists():
+        crear_base_bancaria()
+    conexion = sqlite3.connect(DB_BANCO.resolve().as_uri() + "?mode=ro", uri=True)  # solo lectura
+    conexion.row_factory = sqlite3.Row  # cada fila como diccionario
+    filas = conexion.execute(
+        "SELECT fecha, descripcion, tipo, monto, tipo_cambio FROM movimientos_bancarios WHERE tipo = ?",  # SQL fijo; el valor va en ?
+        (tipo,),
+    ).fetchall()
+    conexion.close()
+    return {"tipo": tipo, "total_bs": sum(float(f["monto"] or 0) for f in filas), "movimientos bancarios": [dict(f) for f in filas]}
+
+@registro.tool_plain
+def registrar_movimientos_bancarios(fecha: str, descripcion: str, tipo: Tipo, monto: float, tipo_cambio: float) -> str:
+    """Anota un movimiento nuevo nuevo. La fecha va como AAAA-MM-DD y el monto en bolivianos."""
+    if not DB_BANCO.exists():
+        crear_base_bancaria()
+    conexion = sqlite3.connect(DB_BANCO)  # sin mode=ro: esta tool sí escribe
+    try:
+        with conexion:  # transacción: guarda todo o nada
+            conexion.execute("INSERT INTO movimientos_bancarios VALUES (?, ?, ?, ?, ?)", (fecha, descripcion, tipo, monto, tipo_cambio))
+    except sqlite3.IntegrityError:  # el CHECK de la tabla rechaza montos de 0 o negativos
+        return f"No se guardó: el monto debe ser mayor que 0 (recibí {monto})."
+    finally:
+        conexion.close()
+    return f"Movimietno Bancario registrado: {descripcion}, {monto} Bs en {tipo} el {fecha}."
+
+
+    
+
